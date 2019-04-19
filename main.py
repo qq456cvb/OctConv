@@ -4,12 +4,15 @@
 import argparse
 import os
 import tensorflow as tf
+from OctConv import OctConv2D
 
 from tensorpack import *
 from tensorpack.dataflow import dataset
 from tensorpack.tfutils.summary import *
 from tensorpack.utils.gpu import get_num_gpu
 
+
+ALPHA = 0.25
 
 
 class Model(ModelDesc):
@@ -27,28 +30,43 @@ class Model(ModelDesc):
 
         if is_training:
             tf.summary.image("train_image", image, 10)
-        if tf.test.is_gpu_available():
-            image = tf.transpose(image, [0, 3, 1, 2])
-            data_format = 'channels_first'
-        else:
-            data_format = 'channels_last'
+        data_format = 'channels_last'
 
         image = image / 4.0     # just to make range smaller
         with argscope(Conv2D, activation=BNReLU, use_bias=False, kernel_size=3), \
                 argscope([Conv2D, MaxPooling, BatchNorm], data_format=data_format):
-            logits = LinearWrap(image) \
-                .Conv2D('conv1.1', filters=64) \
-                .Conv2D('conv1.2', filters=64) \
-                .MaxPooling('pool1', 3, stride=2, padding='SAME') \
-                .Conv2D('conv2.1', filters=128) \
-                .Conv2D('conv2.2', filters=128) \
-                .MaxPooling('pool2', 3, stride=2, padding='SAME') \
-                .Conv2D('conv3.1', filters=128, padding='VALID') \
-                .Conv2D('conv3.2', filters=128, padding='VALID') \
-                .FullyConnected('fc0', 1024 + 512, activation=tf.nn.relu) \
-                .Dropout(rate=drop_rate) \
-                .FullyConnected('fc1', 512, activation=tf.nn.relu) \
-                .FullyConnected('linear', out_dim=self.cifar_classnum)()
+            x = Conv2D('conv_pre', image, filters=64)
+
+            # alpha_in is implicitly defined by previous layer
+            x = OctConv2D('conv1.1', 3, 64, ALPHA)([tf.zeros([tf.shape(x)[0], tf.shape(x)[1] // 2, tf.shape(x)[2] // 2, 0]), x])
+            x = [MaxPooling('pool1', xx, 3, stride=2, padding='SAME') for xx in x]
+
+            x = OctConv2D('conv2.1', 3, 128, ALPHA)(x)
+            x = OctConv2D('conv2.2', 3, 128, ALPHA)(x)
+            x = [MaxPooling('pool2', xx, 3, stride=2, padding='SAME') for xx in x]
+
+            x = OctConv2D('conv3.1', 3, 128, ALPHA)(x)
+            x = OctConv2D('conv3.2', 3, 128, 0)(x)
+
+            x = FullyConnected('fc0', x[1], 1024 + 512, activation=tf.nn.relu)
+            x = Dropout(x, rate=drop_rate)
+            x = FullyConnected('fc1', x, 512, activation=tf.nn.relu)
+            logits = FullyConnected('linear', x, out_dim=self.cifar_classnum)
+
+            # Structure Before
+            # logits = LinearWrap(image) \
+            #     .Conv2D('conv1.1', filters=64) \
+            #     .Conv2D('conv1.2', filters=64) \
+            #     .MaxPooling('pool1', 3, stride=2, padding='SAME') \
+            #     .Conv2D('conv2.1', filters=128) \
+            #     .Conv2D('conv2.2', filters=128) \
+            #     .MaxPooling('pool2', 3, stride=2, padding='SAME') \
+            #     .Conv2D('conv3.1', filters=128, padding='VALID') \
+            #     .Conv2D('conv3.2', filters=128, padding='VALID') \
+            #     .FullyConnected('fc0', 1024 + 512, activation=tf.nn.relu) \
+            #     .Dropout(rate=drop_rate) \
+            #     .FullyConnected('fc1', 512, activation=tf.nn.relu) \
+            #     .FullyConnected('linear', out_dim=self.cifar_classnum)()
 
         cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
         cost = tf.reduce_mean(cost, name='cross_entropy_loss')
@@ -92,7 +110,7 @@ def get_data(train_or_test, cifar_classnum):
     ds = AugmentImageComponent(ds, augmentors)
     ds = BatchData(ds, 128, remainder=not isTrain)
     if isTrain:
-        ds = PrefetchDataZMQ(ds, 5)
+        ds = PrefetchData(ds, 4, 4)
     return ds
 
 
